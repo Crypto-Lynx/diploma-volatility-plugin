@@ -55,17 +55,24 @@ class SubsystemAResult:
     hidden_modules: Set[int]
     orphan_modules: Set[int]
     symbols_missing: Set[str]
+    status: str
+    notes: Tuple[str, ...]
 
 
 @dataclasses.dataclass(frozen=True)
 class SubsystemBResult:
     hooks: Set[HookRecord]
     invalid_idt_scan: bool
+    status: str
+    notes: Tuple[str, ...]
 
 
 @dataclasses.dataclass(frozen=True)
 class SubsystemCResult:
     hidden_tasks: Set[HiddenTask]
+    status: str
+    available_views: Tuple[str, ...]
+    notes: Tuple[str, ...]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -81,26 +88,31 @@ class SubsystemA:
         self.plugin = plugin
 
     def run(self) -> SubsystemAResult:
-        vmlinux = self.plugin.vmlinux
         missing: Set[str] = set()
+        notes: List[str] = []
 
         M_raw = self._collect_modules_raw()
         K_raw, k_missing = self._collect_module_kset_raw()
         V_raw, v_missing = self._collect_vmap_raw()
         missing |= k_missing | v_missing
 
-        M = {self.plugin.normalize_ptr("module", ptr) for ptr in M_raw}
-        K = {self.plugin.normalize_ptr("kobj", ptr) for ptr in K_raw}
-        V = {self.plugin.normalize_ptr("vmap", ptr) for ptr in V_raw}
+        M = self._normalize_candidates("module", M_raw, notes)
+        K = self._normalize_candidates("kobj", K_raw, notes)
+        V = self._normalize_candidates("vmap", V_raw, notes)
 
-        self.plugin.invariant(len(M) > 0, "|M| must be > 0 on valid system")
-        if "module_kset" not in missing:
-            self.plugin.invariant(
-                len(K) > 0, "K must not be empty when module_kset exists"
+        # Soft validation: on hostile or partially-supported kernels we keep going.
+        if len(M) == 0:
+            notes.append("module-list-normalization-empty")
+            vollog.warning("SubsystemA: normalized module list is empty")
+        if "module_kset" not in missing and len(K) == 0:
+            notes.append("module-kset-empty-after-normalization")
+            vollog.warning(
+                "SubsystemA: module_kset present but yielded no valid normalized entries"
             )
-        if "vmap_area_list" not in missing:
-            self.plugin.invariant(
-                len(V) > 0, "V must be non-trivial when vmap_area_list exists"
+        if "vmap_area_list" not in missing and len(V) == 0:
+            notes.append("vmap-empty-after-normalization")
+            vollog.warning(
+                "SubsystemA: vmap_area_list present but yielded no valid normalized entries"
             )
 
         S_all = M | K | V
@@ -121,7 +133,7 @@ class SubsystemA:
 
         carved = self._page_aligned_carving()
         filters = self._collect_dynamic_code_filters()
-        self._assert_filter_safety(filters)
+        self._assert_filter_safety(filters, notes)
 
         region_candidates: Set[Region] = set()
         for addr in hidden_modules:
@@ -141,22 +153,43 @@ class SubsystemA:
             )
         }
 
+        validated: Set[Region] = set()
         for region in filtered:
-            self.plugin.invariant(
-                self.plugin.page_aligned(region.base),
-                "AnomalousRegions base must be page-aligned",
-            )
-            self.plugin.invariant(
-                self.plugin.is_canonical(region.base),
-                "AnomalousRegions base must be canonical",
-            )
+            if not self.plugin.page_aligned(region.base):
+                notes.append(f"non-page-aligned-region:{region.detail}")
+                continue
+            if not self.plugin.is_canonical(region.base):
+                notes.append(f"non-canonical-region:{region.detail}")
+                continue
+            validated.add(region)
+
+        if missing == {"module_kset", "vmap_area_list"} and len(M) == 0:
+            status = "unavailable"
+        elif missing or notes:
+            status = "partial"
+        else:
+            status = "success"
 
         return SubsystemAResult(
-            anomalous_regions=filtered,
+            anomalous_regions=validated,
             hidden_modules=hidden_modules,
             orphan_modules=orphan_modules,
             symbols_missing=missing,
+            status=status,
+            notes=tuple(notes),
         )
+
+    def _normalize_candidates(
+        self, source: str, raw: Set[int], notes: List[str]
+    ) -> Set[int]:
+        normalized: Set[int] = set()
+        for ptr in raw:
+            n_ptr = self.plugin.normalize_ptr(source, ptr, strict=False)
+            if n_ptr == 0:
+                notes.append(f"normalize-skip:{source}:0x{ptr:x}")
+                continue
+            normalized.add(n_ptr)
+        return normalized
 
     def _collect_modules_raw(self) -> Set[int]:
         raw: Set[int] = set()
@@ -304,14 +337,13 @@ class SubsystemA:
             ftrace_ops_list = self.plugin.vmlinux.object_from_symbol(
                 symbol_name="ftrace_ops_list"
             )
-            list_off = self.plugin.get_offset("ftrace_ops", "list")
-            for node in ftrace_ops_list.to_list(
-                self.plugin.vmlinux.symbol_table_name + "!list_head", "next"
-            ):
+            for node in self.plugin.iter_list_head(ftrace_ops_list):
                 try:
                     ops = self.plugin.vmlinux.object(
                         object_type="ftrace_ops",
-                        offset=int(node.vol.offset) - list_off,
+                        offset=self.plugin.container_of(
+                            int(node.vol.offset), "ftrace_ops", "list"
+                        ),
                         absolute=True,
                     )
                     callback = int(getattr(ops, "func", 0) or 0)
@@ -369,16 +401,15 @@ class SubsystemA:
             vollog.warning("SubsystemA: kprobe filter enumeration unavailable: %s", exc)
         return regions
 
-    def _assert_filter_safety(self, filters: Set[Region]) -> None:
+    def _assert_filter_safety(self, filters: Set[Region], notes: List[str]) -> None:
         legit = self.plugin.build_whitelist()
         for region in filters:
             overlaps_legit = any(
                 self.plugin.overlap(region.base, region.end, s, e) for s, e in legit
             )
-            self.plugin.invariant(
-                not overlaps_legit,
-                f"FilteredRegions must not overlap known kernel/module text ({region.detail})",
-            )
+            # Soft validation: filter overlap is expected for some kernel trampolines.
+            if overlaps_legit:
+                notes.append(f"filter-overlap:{region.detail}")
 
 
 class SubsystemB:
@@ -388,22 +419,26 @@ class SubsystemB:
         self.plugin = plugin
 
     def run(self) -> SubsystemBResult:
+        notes: List[str] = []
         whitelist = self.plugin.build_whitelist()
-        self.plugin.invariant(
-            len(whitelist) > 0, "Whitelist must contain at least kernel text"
-        )
+        if len(whitelist) == 0:
+            vollog.warning("SubsystemB: whitelist is empty; subsystem unavailable")
+            return SubsystemBResult(set(), True, "unavailable", ("empty-whitelist",))
 
         hooks: Set[HookRecord] = set()
         hooks |= self._check_syscalls(whitelist)
-        idt_hooks, invalid_idt = self._check_idt(whitelist)
+        idt_hooks, invalid_idt = self._check_idt(whitelist, notes)
         hooks |= idt_hooks
         hooks |= self._check_vfs(whitelist)
-        hooks |= self._check_netfilter(whitelist)
-        hooks |= self._check_ftrace(whitelist)
+        hooks |= self._check_netfilter(whitelist, notes)
+        hooks |= self._check_ftrace(whitelist, notes)
         hooks |= self._check_kprobes(whitelist)
 
         hooks = {h for h in hooks if self.plugin.is_canonical(h.pointer)}
-        return SubsystemBResult(hooks=hooks, invalid_idt_scan=invalid_idt)
+        status = "partial" if notes else "success"
+        return SubsystemBResult(
+            hooks=hooks, invalid_idt_scan=invalid_idt, status=status, notes=tuple(notes)
+        )
 
     def _check_syscalls(self, whitelist: Sequence[Tuple[int, int]]) -> Set[HookRecord]:
         findings: Set[HookRecord] = set()
@@ -421,7 +456,7 @@ class SubsystemB:
         return findings
 
     def _check_idt(
-        self, whitelist: Sequence[Tuple[int, int]]
+        self, whitelist: Sequence[Tuple[int, int]], notes: List[str]
     ) -> Tuple[Set[HookRecord], bool]:
         findings: Set[HookRecord] = set()
         flagged = 0
@@ -435,12 +470,9 @@ class SubsystemB:
                 p = self.plugin.decode_idt_gate(gate)
                 if p == 0:
                     continue
-                self.plugin.invariant(
-                    self.plugin.is_canonical(p), "IDT pointer must be canonical"
-                )
-                if self.plugin.in_whitelist(
-                    p, whitelist
-                ) or self.plugin.in_entry_regions(p):
+                if not self.plugin.is_canonical(p):
+                    continue
+                if self.plugin.in_whitelist(p, whitelist):
                     continue
                 flagged += 1
                 findings.add(HookRecord("idt", p, f"idt[{idx}]"))
@@ -448,12 +480,13 @@ class SubsystemB:
             vollog.warning("SubsystemB IDT check failed: %s", exc)
             return set(), True
 
-        if total > 0 and flagged > total // 2:
+        if total > 0 and flagged > max(total // 3, 32):
             vollog.error(
-                "SubsystemB IDT invalid detection: %d/%d entries flagged",
+                "SubsystemB IDT likely whitelist/modeling failure: %d/%d entries flagged",
                 flagged,
                 total,
             )
+            notes.append(f"idt-overfire:{flagged}/{total}")
             return set(), True
         return findings, False
 
@@ -491,39 +524,75 @@ class SubsystemB:
             vollog.warning("SubsystemB VFS check failed: %s", exc)
         return findings
 
-    def _check_netfilter(self, whitelist: Sequence[Tuple[int, int]]) -> Set[HookRecord]:
+    def _check_netfilter(
+        self, whitelist: Sequence[Tuple[int, int]], notes: List[str]
+    ) -> Set[HookRecord]:
         findings: Set[HookRecord] = set()
+        nf_hooks = self.plugin.object_from_symbol_any(("nf_hooks",))
+        init_net = self.plugin.object_from_symbol_any(("init_net",))
+        if nf_hooks is None and init_net is None:
+            notes.append("netfilter-unavailable")
+            vollog.warning("SubsystemB netfilter check unavailable: no compatible symbols")
+            return findings
         try:
-            nf_hooks = self.plugin.vmlinux.object_from_symbol(symbol_name="nf_hooks")
-            for proto_idx, hook_arr in enumerate(nf_hooks):
-                for hook_idx, list_head in enumerate(hook_arr):
-                    for hook in list_head.to_list(
-                        self.plugin.vmlinux.symbol_table_name + "!nf_hook_ops", "list"
-                    ):
-                        p = self.plugin.canonicalize(int(getattr(hook, "hook", 0) or 0))
-                        if p and not self.plugin.in_whitelist(p, whitelist):
-                            findings.add(
-                                HookRecord(
-                                    "netfilter", p, f"nf_hooks[{proto_idx}][{hook_idx}]"
-                                )
+            if nf_hooks is not None:
+                for proto_idx, hook_arr in enumerate(nf_hooks):
+                    for hook_idx, list_head in enumerate(hook_arr):
+                        for hook in list_head.to_list(
+                            self.plugin.vmlinux.symbol_table_name + "!nf_hook_ops", "list"
+                        ):
+                            p = self.plugin.canonicalize(
+                                int(getattr(hook, "hook", 0) or 0)
                             )
+                            if p and not self.plugin.in_whitelist(p, whitelist):
+                                findings.add(
+                                    HookRecord(
+                                        "netfilter",
+                                        p,
+                                        f"nf_hooks[{proto_idx}][{hook_idx}]",
+                                    )
+                                )
+            elif init_net is not None:
+                nf = getattr(init_net, "nf", None)
+                hooks = getattr(nf, "hooks", None) if nf is not None else None
+                if hooks is None:
+                    notes.append("netfilter-layout-unsupported")
+                    return findings
+                for proto_idx, hook_arr in enumerate(hooks):
+                    for hook_idx, list_head in enumerate(hook_arr):
+                        for hook in list_head.to_list(
+                            self.plugin.vmlinux.symbol_table_name + "!nf_hook_ops", "list"
+                        ):
+                            p = self.plugin.canonicalize(
+                                int(getattr(hook, "hook", 0) or 0)
+                            )
+                            if p and not self.plugin.in_whitelist(p, whitelist):
+                                findings.add(
+                                    HookRecord(
+                                        "netfilter",
+                                        p,
+                                        f"init_net.nf.hooks[{proto_idx}][{hook_idx}]",
+                                    )
+                                )
         except Exception as exc:
             vollog.warning("SubsystemB netfilter check failed: %s", exc)
+            notes.append("netfilter-enumeration-failed")
         return findings
 
-    def _check_ftrace(self, whitelist: Sequence[Tuple[int, int]]) -> Set[HookRecord]:
+    def _check_ftrace(
+        self, whitelist: Sequence[Tuple[int, int]], notes: List[str]
+    ) -> Set[HookRecord]:
         findings: Set[HookRecord] = set()
         try:
             ftrace_ops_list = self.plugin.vmlinux.object_from_symbol(
                 symbol_name="ftrace_ops_list"
             )
-            list_off = self.plugin.get_offset("ftrace_ops", "list")
-            for node in ftrace_ops_list.to_list(
-                self.plugin.vmlinux.symbol_table_name + "!list_head", "next"
-            ):
+            for node in self.plugin.iter_list_head(ftrace_ops_list):
                 ops = self.plugin.vmlinux.object(
                     object_type="ftrace_ops",
-                    offset=int(node.vol.offset) - list_off,
+                    offset=self.plugin.container_of(
+                        int(node.vol.offset), "ftrace_ops", "list"
+                    ),
                     absolute=True,
                 )
                 p = self.plugin.canonicalize(int(getattr(ops, "func", 0) or 0))
@@ -531,6 +600,7 @@ class SubsystemB:
                     findings.add(HookRecord("ftrace", p, "ftrace_ops.func"))
         except Exception as exc:
             vollog.warning("SubsystemB ftrace check failed: %s", exc)
+            notes.append("ftrace-unavailable")
         return findings
 
     def _check_kprobes(self, whitelist: Sequence[Tuple[int, int]]) -> Set[HookRecord]:
@@ -572,9 +642,17 @@ class SubsystemC:
         self.plugin = plugin
 
     def run(self) -> SubsystemCResult:
+        notes: List[str] = []
+        views: List[str] = []
         T_list = self._collect_task_set_from_list()
+        if T_list:
+            views.append("list")
         T_runq = self._collect_task_set_from_runqueues()
-        T_pid = self._collect_task_set_from_pid_hash()
+        if T_runq:
+            views.append("runq")
+        T_pid = self._collect_task_set_from_pid_hash(notes)
+        if T_pid:
+            views.append("pid")
 
         hidden_ptrs = (T_runq | T_pid) - T_list
         hidden: Set[HiddenTask] = set()
@@ -600,7 +678,20 @@ class SubsystemC:
             )
 
         vollog.info("SubsystemC hidden tasks: %d", len(hidden))
-        return SubsystemCResult(hidden_tasks=hidden)
+        if len(views) >= 3:
+            status = "success"
+        elif len(views) >= 1:
+            status = "partial"
+        else:
+            status = "unavailable"
+            notes.append("no-process-views")
+
+        return SubsystemCResult(
+            hidden_tasks=hidden,
+            status=status,
+            available_views=tuple(sorted(set(views))),
+            notes=tuple(notes),
+        )
 
     def _collect_task_set_from_list(self) -> Set[int]:
         out: Set[int] = set()
@@ -632,10 +723,14 @@ class SubsystemC:
             vollog.warning("SubsystemC runqueue collection failed: %s", exc)
         return out
 
-    def _collect_task_set_from_pid_hash(self) -> Set[int]:
+    def _collect_task_set_from_pid_hash(self, notes: List[str]) -> Set[int]:
         out: Set[int] = set()
+        pidhash = self.plugin.object_from_symbol_any(("pid_hash",))
+        if pidhash is None:
+            notes.append("pid_hash-missing")
+            vollog.warning("SubsystemC pid hash unavailable; attempting fallback view")
+            return self._collect_task_set_from_init_walk(notes)
         try:
-            pidhash = self.plugin.vmlinux.object_from_symbol(symbol_name="pid_hash")
             for bucket in pidhash:
                 for upid in bucket.to_list(
                     self.plugin.vmlinux.symbol_table_name + "!upid", "pid_chain"
@@ -649,6 +744,22 @@ class SubsystemC:
                         continue
         except Exception as exc:
             vollog.warning("SubsystemC pid hash collection failed: %s", exc)
+            notes.append("pid_hash-enumeration-failed")
+            return self._collect_task_set_from_init_walk(notes)
+        return out
+
+    def _collect_task_set_from_init_walk(self, notes: List[str]) -> Set[int]:
+        out: Set[int] = set()
+        try:
+            init_task = self.plugin.vmlinux.object_from_symbol(symbol_name="init_task")
+            tasks = init_task.tasks
+            for task in tasks.to_list(
+                self.plugin.vmlinux.symbol_table_name + "!task_struct", "tasks"
+            ):
+                out.add(self.plugin.canonicalize(int(task.vol.offset)))
+        except Exception as exc:
+            notes.append("pid-fallback-unavailable")
+            vollog.warning("SubsystemC init_task fallback failed: %s", exc)
         return out
 
     def _safe_task(self, task_addr: int):
@@ -689,17 +800,26 @@ class Aggregator:
         has_hidden_tasks = len(c_result.hidden_tasks) > 0
         has_regions = len(a_result.anomalous_regions) > 0
         has_correlated = len(correlations) > 0
+        non_idt_hooks = any(h.hook_type != "idt" for h in b_result.hooks)
+        a_reliable = a_result.status in {"success", "partial"}
 
         if has_correlated and has_hidden_tasks:
             detection = "Hybrid Rootkit"
-        elif has_correlated:
+        elif has_correlated and a_reliable:
             detection = "Confirmed LKM Rootkit"
         elif has_hidden_tasks and not has_hooks:
             detection = "DKOM Rootkit"
+        elif has_hidden_tasks and has_hooks and not has_correlated:
+            detection = "Hybrid Suspicious"
         elif has_regions:
             detection = "Suspicious"
         elif has_hooks:
-            detection = "Confirmed LKM Rootkit"
+            # Raw hook output without spatial correlation is suspicious, not confirmed.
+            # IDT-only overfire must never directly confirm malware.
+            if b_result.invalid_idt_scan or not non_idt_hooks:
+                detection = "Suspicious"
+            else:
+                detection = "Suspicious"
         else:
             detection = "Suspicious"
 
@@ -745,23 +865,43 @@ class CompositeRootkit(interfaces.plugins.PluginInterface):
             a_result = SubsystemA(self).run()
         except Exception as exc:
             vollog.exception("Subsystem A failed: %s", exc)
-            a_result = SubsystemAResult(set(), set(), set(), {"subsystem_a_failed"})
+            a_result = SubsystemAResult(
+                set(),
+                set(),
+                set(),
+                {"subsystem_a_failed"},
+                "degraded",
+                ("subsystem-a-exception",),
+            )
 
         try:
             b_result = SubsystemB(self).run()
         except Exception as exc:
             vollog.exception("Subsystem B failed: %s", exc)
-            b_result = SubsystemBResult(set(), True)
+            b_result = SubsystemBResult(set(), True, "degraded", ("subsystem-b-exception",))
 
         try:
             c_result = SubsystemC(self).run()
         except Exception as exc:
             vollog.exception("Subsystem C failed: %s", exc)
-            c_result = SubsystemCResult(set())
+            c_result = SubsystemCResult(
+                set(), "degraded", tuple(), ("subsystem-c-exception",)
+            )
 
         agg = Aggregator(self).run(a_result, b_result, c_result)
 
         header = agg.detection_type
+        for label, status, details in (
+            ("SubsystemA", a_result.status, ",".join(a_result.notes) or "ok"),
+            ("SubsystemB", b_result.status, ",".join(b_result.notes) or "ok"),
+            (
+                "SubsystemC",
+                c_result.status,
+                f"views={','.join(c_result.available_views) or 'none'};notes={','.join(c_result.notes) or 'ok'}",
+            ),
+        ):
+            yield (0, (header, "SubsystemStatus", label, format_hints.Hex(0), f"{status};{details}"))
+            header = ""
 
         if a_result.anomalous_regions:
             for region in sorted(a_result.anomalous_regions, key=lambda x: x.base):
@@ -853,12 +993,22 @@ class CompositeRootkit(interfaces.plugins.PluginInterface):
     def page_aligned(self, ptr: int) -> bool:
         return (ptr & 0xFFF) == 0
 
-    def normalize_ptr(self, kind: str, ptr: int) -> int:
-        """f(x): normalize list/kobject/vmap pointers to allocation base."""
+    def normalize_ptr(self, kind: str, ptr: int, strict: bool = True) -> int:
+        """f(x): source-sensitive normalization to allocation/module base.
+
+        Hard invariant: canonical pointer math must not underflow internal model.
+        Soft validation: candidate pointers from hostile memory are discardable.
+        """
         p = self.canonicalize(ptr)
+        if not self.is_canonical(p):
+            if strict:
+                self.invariant(False, "f(x) must produce canonical kernel pointer")
+            return 0
         if kind == "module":
-            return p
-        if kind == "kobj":
+            # module list nodes already point to struct module base.
+            pass
+        elif kind == "kobj":
+            # kobject pointer is nested and not page aligned; subtract member offset.
             off = self.get_offset("module_kobject", "kobj")
             p = self.canonicalize(p - off)
         elif kind == "vmap":
@@ -871,13 +1021,39 @@ class CompositeRootkit(interfaces.plugins.PluginInterface):
                 )
             except Exception:
                 p = self.canonicalize(p)
+        else:
+            if strict:
+                self.invariant(False, f"unknown normalization source: {kind}")
+            return 0
 
-        self.invariant(
-            self.is_canonical(p), "f(x) must produce canonical kernel pointer"
-        )
-        near_alignment = self.page_aligned(p) or self.page_aligned(p & ~0x1FF)
-        self.invariant(near_alignment, "f(x) must be page-aligned or near module base")
+        if not self.is_canonical(p):
+            if strict:
+                self.invariant(False, "f(x) must produce canonical kernel pointer")
+            return 0
+
+        # Alignment is source-specific. Only final base pointers need page alignment.
+        if kind in {"module", "vmap", "kobj"} and not self.page_aligned(p):
+            if strict:
+                self.invariant(False, "normalized base must be page-aligned")
+            return 0
         return p
+
+    def object_from_symbol_any(self, symbols: Sequence[str]):
+        for symbol in symbols:
+            try:
+                return self.vmlinux.object_from_symbol(symbol_name=symbol)
+            except Exception:
+                continue
+        return None
+
+    def container_of(self, addr: int, struct_name: str, member_name: str) -> int:
+        return self.canonicalize(addr - self.get_offset(struct_name, member_name))
+
+    def iter_list_head(self, list_head_obj):
+        return list_head_obj.to_list(
+            self.vmlinux.symbol_table_name + "!list_head",
+            "next",
+        )
 
     def get_kaslr_shift(self) -> int:
         try:
@@ -982,18 +1158,22 @@ class CompositeRootkit(interfaces.plugins.PluginInterface):
         if text:
             whitelist.append(text)
 
-        for sym in (
-            "__entry_text_start",
-            "__entry_text_end",
-            "entry_trampoline",
-            "cpu_entry_area",
+        # Extended IDT/entry whitelist for modern x86 kernel entry paths.
+        for start_sym, end_sym in (
+            ("__entry_text_start", "__entry_text_end"),
+            ("entry_text_start", "entry_text_end"),
+            ("__irqentry_text_start", "__irqentry_text_end"),
+            ("__exception_text_start", "__exception_text_end"),
         ):
-            try:
-                addr = int(self.vmlinux.object_from_symbol(symbol_name=sym).vol.offset)
-                addr = self.canonicalize(addr)
-                whitelist.append((addr, addr + 0x4000))
-            except Exception:
+            rng = sym_range(start_sym, end_sym)
+            if rng:
+                whitelist.append(rng)
+        for sym in ("entry_trampoline", "cpu_entry_area", "asm_exc_page_fault"):
+            obj = self.object_from_symbol_any((sym,))
+            if obj is None:
                 continue
+            addr = self.canonicalize(int(obj.vol.offset))
+            whitelist.append((addr, addr + 0x4000))
 
         for mod in lsmod.Lsmod.list_modules(self.context, self.config["kernel"]):
             try:
@@ -1012,10 +1192,20 @@ class CompositeRootkit(interfaces.plugins.PluginInterface):
             except Exception:
                 continue
 
-        if not whitelist:
-            raise exceptions.VolatilityException("Whitelist construction failed")
+        return self.merge_ranges(whitelist)
 
-        return whitelist
+    def merge_ranges(self, ranges: Sequence[Tuple[int, int]]) -> List[Tuple[int, int]]:
+        cleaned = sorted([(s, e) for s, e in ranges if s and e and s < e], key=lambda x: x[0])
+        if not cleaned:
+            return []
+        merged: List[Tuple[int, int]] = [cleaned[0]]
+        for s, e in cleaned[1:]:
+            ms, me = merged[-1]
+            if s <= me:
+                merged[-1] = (ms, max(me, e))
+            else:
+                merged.append((s, e))
+        return merged
 
     def in_whitelist(self, ptr: int, whitelist: Sequence[Tuple[int, int]]) -> bool:
         p = self.canonicalize(ptr)
@@ -1023,16 +1213,7 @@ class CompositeRootkit(interfaces.plugins.PluginInterface):
 
     def in_entry_regions(self, ptr: int) -> bool:
         p = self.canonicalize(ptr)
-        for sym in ("__entry_text_start", "entry_trampoline", "cpu_entry_area"):
-            try:
-                base = self.canonicalize(
-                    int(self.vmlinux.object_from_symbol(symbol_name=sym).vol.offset)
-                )
-                if base <= p < base + 0x4000:
-                    return True
-            except Exception:
-                continue
-        return False
+        return self.in_whitelist(p, self.build_whitelist())
 
     def decode_idt_gate(self, gate) -> int:
         low = int(getattr(gate, "offset_low", 0) or 0)

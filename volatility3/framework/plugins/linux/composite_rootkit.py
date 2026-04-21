@@ -237,7 +237,20 @@ class CompositeRootkit(interfaces.plugins.PluginInterface):
                 object_type="module", offset=page_addr, absolute=True
             )
         except Exception:
-            return None
+            pass
+        try:
+            raw_module_core = int(mod.module_core)
+        except Exception:
+            pass
+        vollog.debug("reconstruct_module: candidate=0x%x", page_addr)
+        vollog.debug("raw core_layout.base=0x%x", raw_core_layout_base)
+        vollog.debug("raw module_core=0x%x", raw_module_core)
+
+        base = self._module_base(mod)
+        size = self._module_size(mod)
+        if base == 0:
+            base = page_addr
+            vollog.debug("fallback base applied=0x%x", base)
 
         name = self._safe_module_name(mod)
         if not self._valid_ascii_name(name):

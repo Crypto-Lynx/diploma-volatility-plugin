@@ -406,15 +406,10 @@ class CompositeRootkit(interfaces.plugins.PluginInterface):
 
     def _kernel_text_range(self) -> Tuple[int, int]:
         shift = self._kaslr_shift()
-        stext = self._symbol_addr("_stext") or self._symbol_addr("_text")
-        kend = self._symbol_addr("_end")
+        stext = self._symbol_addr("_stext")
+        etext = self._symbol_addr("_etext")
         start = self._canonicalize(stext + shift)
-        end = self._canonicalize(kend + shift)
-        vollog.debug(
-            "KASLR kernel range: kernel_start=0x%x kernel_end=0x%x",
-            start,
-            end,
-        )
+        end = self._canonicalize(etext + shift)
         if end <= start:
             return (0, 0)
         return (start, end)
@@ -424,22 +419,13 @@ class CompositeRootkit(interfaces.plugins.PluginInterface):
             runtime = self.vmlinux.object_from_symbol(symbol_name="init_task")
             runtime_addr = self._canonicalize(int(runtime.vol.offset))
             static_addr = self._canonicalize(self._symbol_addr("init_task"))
-            shift = runtime_addr - static_addr
-            vollog.debug(
-                "KASLR init_task: static=0x%x runtime=0x%x shift=0x%x",
-                static_addr,
-                runtime_addr,
-                shift,
-            )
-            return shift
+            return runtime_addr - static_addr
         except Exception:
             return 0
 
     def _symbol_addr(self, name: str) -> int:
         try:
-            sym = self.context.symbol_space.get_symbol(
-                self.vmlinux.symbol_table_name + "!" + name
-            )
+            sym = self.vmlinux.get_symbol(name)
             return int(sym.address)
         except Exception:
             return 0

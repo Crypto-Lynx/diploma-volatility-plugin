@@ -214,7 +214,7 @@ class CompositeRootkit(interfaces.plugins.PluginInterface):
         while cur < end:
             size = min(CHUNK_SIZE, end - cur)
             try:
-                data = self.layer.read(cur, size, pad=False)
+                data = self.layer.read(cur, size, pad=True)
             except Exception:
                 cur += size
                 continue
@@ -233,7 +233,9 @@ class CompositeRootkit(interfaces.plugins.PluginInterface):
         self, page_addr: int
     ) -> Optional[Tuple[str, int, int, str]]:
         try:
-            mod = self.vmlinux.object(object_type="module", offset=page_addr, absolute=True)
+            mod = self.vmlinux.object(
+                object_type="module", offset=page_addr, absolute=True
+            )
         except Exception:
             return None
 
@@ -244,7 +246,7 @@ class CompositeRootkit(interfaces.plugins.PluginInterface):
         base = self._module_base(mod)
         size = self._module_size(mod)
         if base == 0:
-            return None
+            base = page_addr
 
         if size > 0 and base <= page_addr < base + size:
             return (name, base, size, "strong")
@@ -297,7 +299,9 @@ class CompositeRootkit(interfaces.plugins.PluginInterface):
             if region not in {"suspicious_executable", "unknown_mapped", "invalid"}:
                 continue
 
-            conf = "high" if region in {"suspicious_executable", "invalid"} else "medium"
+            conf = (
+                "high" if region in {"suspicious_executable", "invalid"} else "medium"
+            )
             evidence.append(
                 EvidenceRow(
                     subsystem="B1",
@@ -309,14 +313,18 @@ class CompositeRootkit(interfaces.plugins.PluginInterface):
                     confidence=conf,
                     note="syscall entry points outside expected trusted regions",
                     raw_pointer=raw_ptr,
-                    resolved_region=self._region_debug(p, known_modules, kernel_start, kernel_end),
+                    resolved_region=self._region_debug(
+                        p, known_modules, kernel_start, kernel_end
+                    ),
                     source_structure="sys_call_table",
                 )
             )
 
         return evidence
 
-    def _locate_sys_call_table(self, kernel_start: int, kernel_end: int) -> Optional[int]:
+    def _locate_sys_call_table(
+        self, kernel_start: int, kernel_end: int
+    ) -> Optional[int]:
         try:
             sym = self.vmlinux.object_from_symbol(symbol_name="sys_call_table")
             return self._canonicalize(int(sym.vol.offset))
@@ -334,7 +342,9 @@ class CompositeRootkit(interfaces.plugins.PluginInterface):
                 continue
             good = 0
             for i in range(0, min(300 * ptr_size, len(page) - ptr_size), ptr_size):
-                val = struct.unpack("<Q" if ptr_size == 8 else "<I", page[i : i + ptr_size])[0]
+                val = struct.unpack(
+                    "<Q" if ptr_size == 8 else "<I", page[i : i + ptr_size]
+                )[0]
                 cval = self._canonicalize(val)
                 if kernel_start <= cval < kernel_end:
                     good += 1
@@ -350,18 +360,22 @@ class CompositeRootkit(interfaces.plugins.PluginInterface):
         strong_a = [
             e
             for e in evidence
-            if e.subsystem == "A" and e.confidence == "high" and e.object_type in {"hidden_module_candidate", "carved_module"}
+            if e.subsystem == "A"
+            and e.confidence == "high"
+            and e.object_type in {"hidden_module_candidate", "carved_module"}
         ]
         strong_b1 = [
-            e
-            for e in evidence
-            if e.subsystem == "B1" and e.confidence == "high"
+            e for e in evidence if e.subsystem == "B1" and e.confidence == "high"
         ]
 
         if strong_a and strong_b1:
             for a in strong_a:
                 for b in strong_b1:
-                    if a.address != 0 and b.address != 0 and abs(a.address - b.address) < NEAR_MODULE_WINDOW:
+                    if (
+                        a.address != 0
+                        and b.address != 0
+                        and abs(a.address - b.address) < NEAR_MODULE_WINDOW
+                    ):
                         return "Confirmed Hidden-Module Rootkit"
 
         if strong_b1:
@@ -386,7 +400,9 @@ class CompositeRootkit(interfaces.plugins.PluginInterface):
             out.append(ModuleRegion(name=name, base=base, size=size))
         return out
 
-    def _module_space_bounds(self, known_modules: Sequence[ModuleRegion]) -> Tuple[int, int]:
+    def _module_space_bounds(
+        self, known_modules: Sequence[ModuleRegion]
+    ) -> Tuple[int, int]:
         try:
             start_obj = self.vmlinux.object_from_symbol(symbol_name="MODULES_VADDR")
             end_obj = self.vmlinux.object_from_symbol(symbol_name="MODULES_END")

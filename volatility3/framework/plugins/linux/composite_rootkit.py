@@ -209,38 +209,21 @@ class CompositeRootkit(interfaces.plugins.PluginInterface):
     def _find_list_poison_pages(self, start: int, end: int) -> Set[int]:
         sig = struct.pack("<Q", LIST_POISON1)
         hits: Set[int] = set()
-        list_offset = self._get_offset(self.vmlinux, "module", "list")
 
         cur = start
         while cur < end:
             size = min(CHUNK_SIZE, end - cur)
-            vollog.debug("scanning chunk: start=0x%x size=0x%x", cur, size)
             try:
                 data = self.layer.read(cur, size, pad=True)
-                vollog.debug("chunk read with pad=True")
             except Exception:
                 cur += size
                 continue
 
-            zero_chunk = data == (b"\x00" * len(data))
-            vollog.debug("fully_zero_chunk=%s", zero_chunk)
             pos = data.find(sig)
-            chunk_hits = 0
             while pos != -1:
                 va = cur + pos
-                module_base = va - list_offset
-                vollog.debug("LIST_POISON found at: 0x%x", va)
-                vollog.debug("list_offset: 0x%x", list_offset)
-                vollog.debug("computed module_base: 0x%x", module_base)
-                if module_base % 8 == 0 and self._canonicalize(module_base) != 0:
-                    try:
-                        if self.layer.is_valid(module_base, 0x40):
-                            hits.add(module_base)
-                    except Exception:
-                        pass
-                chunk_hits += 1
+                hits.add(va & ~(PAGE_SIZE - 1))
                 pos = data.find(sig, pos + 1)
-            vollog.debug("list_poison_hits=%d", chunk_hits)
 
             cur += size
 
@@ -250,29 +233,9 @@ class CompositeRootkit(interfaces.plugins.PluginInterface):
         self, page_addr: int
     ) -> Optional[Tuple[str, int, int, str]]:
         try:
-            raw = self.layer.read(page_addr, 0x100, pad=False)
-            if not raw or raw == b"\x00" * len(raw):
-                vollog.debug("reconstruction: failure (zero/unreadable memory) at 0x%x", page_addr)
-                return None
-        except Exception:
-            vollog.debug("reconstruction: failure (read exception) at 0x%x", page_addr)
-            return None
-
-        try:
-            mod = self.vmlinux.object(object_type="module", offset=page_addr, absolute=True)
-        except Exception:
-            vollog.debug("reconstruction: failure (object instantiation) at 0x%x", page_addr)
-            return None
-
-        name = self._safe_module_name(mod)
-        if not self._valid_ascii_name(name):
-            vollog.debug("reconstruction: failure (invalid name) at 0x%x", page_addr)
-            return None
-
-        raw_core_layout_base = 0
-        raw_module_core = 0
-        try:
-            raw_core_layout_base = int(mod.core_layout.base)
+            mod = self.vmlinux.object(
+                object_type="module", offset=page_addr, absolute=True
+            )
         except Exception:
             pass
         try:
@@ -289,10 +252,17 @@ class CompositeRootkit(interfaces.plugins.PluginInterface):
             base = page_addr
             vollog.debug("fallback base applied=0x%x", base)
 
+        name = self._safe_module_name(mod)
+        if not self._valid_ascii_name(name):
+            return None
+
+        base = self._module_base(mod)
+        size = self._module_size(mod)
+        if base == 0:
+            base = page_addr
+
         if size > 0 and base <= page_addr < base + size:
-            vollog.debug("reconstruction: success at 0x%x", page_addr)
             return (name, base, size, "strong")
-        vollog.debug("reconstruction: success (partial) at 0x%x", page_addr)
         return (name, base, max(size, PAGE_SIZE), "partial")
 
     # ---------------------------- Subsystem B1 ----------------------------
@@ -342,7 +312,9 @@ class CompositeRootkit(interfaces.plugins.PluginInterface):
             if region not in {"suspicious_executable", "unknown_mapped", "invalid"}:
                 continue
 
-            conf = "high" if region in {"suspicious_executable", "invalid"} else "medium"
+            conf = (
+                "high" if region in {"suspicious_executable", "invalid"} else "medium"
+            )
             evidence.append(
                 EvidenceRow(
                     subsystem="B1",
@@ -354,44 +326,43 @@ class CompositeRootkit(interfaces.plugins.PluginInterface):
                     confidence=conf,
                     note="syscall entry points outside expected trusted regions",
                     raw_pointer=raw_ptr,
-                    resolved_region=self._region_debug(p, known_modules, kernel_start, kernel_end),
+                    resolved_region=self._region_debug(
+                        p, known_modules, kernel_start, kernel_end
+                    ),
                     source_structure="sys_call_table",
                 )
             )
 
         return evidence
 
-    def _locate_sys_call_table(self, kernel_start: int, kernel_end: int) -> Optional[int]:
+    def _locate_sys_call_table(
+        self, kernel_start: int, kernel_end: int
+    ) -> Optional[int]:
         try:
             sym = self.vmlinux.object_from_symbol(symbol_name="sys_call_table")
-            table = self._canonicalize(int(sym.vol.offset))
-            vollog.debug("sys_call_table located by symbol: 0x%x", table)
-            return table
+            return self._canonicalize(int(sym.vol.offset))
         except Exception:
             pass
 
+        # Heuristic fallback: scan kernel text for pointer-array-like run.
+        # Assumption: table-like region has many canonical kernel pointers.
         ptr_size = self._ptr_size()
-        fmt = "<Q" if ptr_size == 8 else "<I"
-        sys_read = self._canonicalize(self._symbol_addr("sys_read"))
-        sys_write = self._canonicalize(self._symbol_addr("sys_write"))
-        if not sys_read or not sys_write:
-            return None
-        target_sig = struct.pack(fmt, sys_read) + struct.pack(fmt, sys_write)
-
         scan_end = min(kernel_start + 0x2000000, kernel_end)
         for addr in range(kernel_start, scan_end, PAGE_SIZE):
             try:
                 page = self.layer.read(addr, PAGE_SIZE, pad=False)
             except Exception:
                 continue
-            pos = page.find(target_sig)
-            if pos != -1:
-                table = addr + pos
-                vollog.debug("sys_call_table located by signature")
-                vollog.debug("page_base: 0x%x", addr)
-                vollog.debug("offset: 0x%x", pos)
-                vollog.debug("final address: 0x%x", table)
-                return table
+            good = 0
+            for i in range(0, min(300 * ptr_size, len(page) - ptr_size), ptr_size):
+                val = struct.unpack(
+                    "<Q" if ptr_size == 8 else "<I", page[i : i + ptr_size]
+                )[0]
+                cval = self._canonicalize(val)
+                if kernel_start <= cval < kernel_end:
+                    good += 1
+            if good >= 128:
+                return addr
         return None
 
     # ---------------------------- Interpretation ----------------------------
@@ -402,18 +373,22 @@ class CompositeRootkit(interfaces.plugins.PluginInterface):
         strong_a = [
             e
             for e in evidence
-            if e.subsystem == "A" and e.confidence == "high" and e.object_type in {"hidden_module_candidate", "carved_module"}
+            if e.subsystem == "A"
+            and e.confidence == "high"
+            and e.object_type in {"hidden_module_candidate", "carved_module"}
         ]
         strong_b1 = [
-            e
-            for e in evidence
-            if e.subsystem == "B1" and e.confidence == "high"
+            e for e in evidence if e.subsystem == "B1" and e.confidence == "high"
         ]
 
         if strong_a and strong_b1:
             for a in strong_a:
                 for b in strong_b1:
-                    if a.address != 0 and b.address != 0 and abs(a.address - b.address) < NEAR_MODULE_WINDOW:
+                    if (
+                        a.address != 0
+                        and b.address != 0
+                        and abs(a.address - b.address) < NEAR_MODULE_WINDOW
+                    ):
                         return "Confirmed Hidden-Module Rootkit"
 
         if strong_b1:
@@ -438,7 +413,9 @@ class CompositeRootkit(interfaces.plugins.PluginInterface):
             out.append(ModuleRegion(name=name, base=base, size=size))
         return out
 
-    def _module_space_bounds(self, known_modules: Sequence[ModuleRegion]) -> Tuple[int, int]:
+    def _module_space_bounds(
+        self, known_modules: Sequence[ModuleRegion]
+    ) -> Tuple[int, int]:
         try:
             start_obj = self.vmlinux.object_from_symbol(symbol_name="MODULES_VADDR")
             end_obj = self.vmlinux.object_from_symbol(symbol_name="MODULES_END")
@@ -458,15 +435,10 @@ class CompositeRootkit(interfaces.plugins.PluginInterface):
 
     def _kernel_text_range(self) -> Tuple[int, int]:
         shift = self._kaslr_shift()
-        stext = self._symbol_addr("_stext") or self._symbol_addr("_text")
-        kend = self._symbol_addr("_end")
+        stext = self._symbol_addr("_stext")
+        etext = self._symbol_addr("_etext")
         start = self._canonicalize(stext + shift)
-        end = self._canonicalize(kend + shift)
-        vollog.debug(
-            "KASLR kernel range: kernel_start=0x%x kernel_end=0x%x",
-            start,
-            end,
-        )
+        end = self._canonicalize(etext + shift)
         if end <= start:
             return (0, 0)
         return (start, end)
@@ -476,29 +448,14 @@ class CompositeRootkit(interfaces.plugins.PluginInterface):
             runtime = self.vmlinux.object_from_symbol(symbol_name="init_task")
             runtime_addr = self._canonicalize(int(runtime.vol.offset))
             static_addr = self._canonicalize(self._symbol_addr("init_task"))
-            shift = runtime_addr - static_addr
-            vollog.debug(
-                "KASLR init_task: static=0x%x runtime=0x%x shift=0x%x",
-                static_addr,
-                runtime_addr,
-                shift,
-            )
-            return shift
+            return runtime_addr - static_addr
         except Exception:
             return 0
 
     def _symbol_addr(self, name: str) -> int:
         try:
-            sym = self.context.symbol_space.get_symbol(
-                self.vmlinux.symbol_table_name + "!" + name
-            )
+            sym = self.vmlinux.get_symbol(name)
             return int(sym.address)
-        except Exception:
-            return 0
-
-    def _get_offset(self, vmlinux, struct_name: str, field_name: str) -> int:
-        try:
-            return int(vmlinux.get_type(struct_name).relative_child_offset(field_name))
         except Exception:
             return 0
 

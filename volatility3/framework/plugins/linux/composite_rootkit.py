@@ -209,7 +209,6 @@ class CompositeRootkit(interfaces.plugins.PluginInterface):
     def _find_list_poison_pages(self, start: int, end: int) -> Set[int]:
         sig = struct.pack("<Q", LIST_POISON1)
         hits: Set[int] = set()
-        list_offset = self._get_offset(self.vmlinux, "module", "list")
 
         cur = start
         while cur < end:
@@ -223,16 +222,7 @@ class CompositeRootkit(interfaces.plugins.PluginInterface):
             pos = data.find(sig)
             while pos != -1:
                 va = cur + pos
-                module_base = va - list_offset
-                vollog.debug("LIST_POISON found at: 0x%x", va)
-                vollog.debug("list_offset: 0x%x", list_offset)
-                vollog.debug("module_base: 0x%x", module_base)
-                if module_base % 8 == 0 and self._canonicalize(module_base) != 0:
-                    try:
-                        if self.layer.is_valid(module_base, 0x40):
-                            hits.add(module_base)
-                    except Exception:
-                        pass
+                hits.add(va & ~(PAGE_SIZE - 1))
                 pos = data.find(sig, pos + 1)
 
             cur += size
@@ -243,35 +233,21 @@ class CompositeRootkit(interfaces.plugins.PluginInterface):
         self, page_addr: int
     ) -> Optional[Tuple[str, int, int, str]]:
         try:
-            raw = self.layer.read(page_addr, 0x100, pad=False)
-            if not raw or raw == b"\x00" * len(raw):
-                vollog.debug("reconstruction: failure (zero/unreadable memory) at 0x%x", page_addr)
-                return None
-        except Exception:
-            vollog.debug("reconstruction: failure (read exception) at 0x%x", page_addr)
-            return None
-
-        try:
             mod = self.vmlinux.object(object_type="module", offset=page_addr, absolute=True)
         except Exception:
-            vollog.debug("reconstruction: failure (object instantiation) at 0x%x", page_addr)
             return None
 
         name = self._safe_module_name(mod)
         if not self._valid_ascii_name(name):
-            vollog.debug("reconstruction: failure (invalid name) at 0x%x", page_addr)
             return None
 
         base = self._module_base(mod)
         size = self._module_size(mod)
         if base == 0:
-            vollog.debug("reconstruction: failure (zero base) at 0x%x", page_addr)
             return None
 
         if size > 0 and base <= page_addr < base + size:
-            vollog.debug("reconstruction: success at 0x%x", page_addr)
             return (name, base, size, "strong")
-        vollog.debug("reconstruction: success (partial) at 0x%x", page_addr)
         return (name, base, max(size, PAGE_SIZE), "partial")
 
     # ---------------------------- Subsystem B1 ----------------------------
@@ -430,15 +406,10 @@ class CompositeRootkit(interfaces.plugins.PluginInterface):
 
     def _kernel_text_range(self) -> Tuple[int, int]:
         shift = self._kaslr_shift()
-        stext = self._symbol_addr("_stext") or self._symbol_addr("_text")
-        kend = self._symbol_addr("_end")
+        stext = self._symbol_addr("_stext")
+        etext = self._symbol_addr("_etext")
         start = self._canonicalize(stext + shift)
-        end = self._canonicalize(kend + shift)
-        vollog.debug(
-            "KASLR kernel range: kernel_start=0x%x kernel_end=0x%x",
-            start,
-            end,
-        )
+        end = self._canonicalize(etext + shift)
         if end <= start:
             return (0, 0)
         return (start, end)
@@ -448,29 +419,14 @@ class CompositeRootkit(interfaces.plugins.PluginInterface):
             runtime = self.vmlinux.object_from_symbol(symbol_name="init_task")
             runtime_addr = self._canonicalize(int(runtime.vol.offset))
             static_addr = self._canonicalize(self._symbol_addr("init_task"))
-            shift = runtime_addr - static_addr
-            vollog.debug(
-                "KASLR init_task: static=0x%x runtime=0x%x shift=0x%x",
-                static_addr,
-                runtime_addr,
-                shift,
-            )
-            return shift
+            return runtime_addr - static_addr
         except Exception:
             return 0
 
     def _symbol_addr(self, name: str) -> int:
         try:
-            sym = self.context.symbol_space.get_symbol(
-                self.vmlinux.symbol_table_name + "!" + name
-            )
+            sym = self.vmlinux.get_symbol(name)
             return int(sym.address)
-        except Exception:
-            return 0
-
-    def _get_offset(self, vmlinux, struct_name: str, field_name: str) -> int:
-        try:
-            return int(vmlinux.get_type(struct_name).relative_child_offset(field_name))
         except Exception:
             return 0
 

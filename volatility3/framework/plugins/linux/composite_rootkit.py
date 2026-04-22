@@ -44,6 +44,8 @@ class EvidenceRow:
     resolved_region: str
     source_structure: str
 
+    _required_framework_version = (2, 0, 0)
+    _version = (1, 0, 0)
 
 class CompositeRootkit(interfaces.plugins.PluginInterface):
     """Version 1 evidence-based Linux rootkit detector (Subsystem A + B1)."""
@@ -176,6 +178,15 @@ class CompositeRootkit(interfaces.plugins.PluginInterface):
                     )
                 )
                 continue
+            pos = page.find(target_sig)
+            if pos != -1:
+                table = addr + pos
+                vollog.debug("sys_call_table located by signature")
+                vollog.debug("page_base: 0x%x", addr)
+                vollog.debug("offset: 0x%x", pos)
+                vollog.debug("final address: 0x%x", table)
+                return table
+        return None
 
             name, base, size, completeness = mod
             if (name, base) in known_keys:

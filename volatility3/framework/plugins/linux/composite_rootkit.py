@@ -255,6 +255,7 @@ class CompositeRootkit(interfaces.plugins.PluginInterface):
         name = self._safe_module_name(mod)
         if not self._valid_ascii_name(name):
             return None
+        target_sig = struct.pack(fmt, sys_read) + struct.pack(fmt, sys_write)
 
         base = self._module_base(mod)
         size = self._module_size(mod)
